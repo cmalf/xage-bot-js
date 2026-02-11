@@ -1,25 +1,29 @@
 // index.js (CommonJS) — Node.js >= 18 has global fetch by default
-
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline/promises");
 const { stdin: input, stdout: output } = require("process");
-
 const BASE_URL = "https://xage.app";
-const REFERER = "https://xage.app/app";
+const REFERER_APP = "https://xage.app/app";
+const REFERER_TRADEX = "https://xage.app/app/games/tradex";
 const CONFIG_PATH = path.join(__dirname, "config.json");
-
-// Delay between tasks (12–15 seconds)
+// Task delay (12–15 seconds)
 const TASK_DELAY_MIN_MS = 12000;
 const TASK_DELAY_MAX_MS = 15000;
-
+// Delay antara token 1 dan token 2 dalam satu pair (~5 menit)
+const TRADEX_BETWEEN_TOKENS_MIN_MS = 315000;
+const TRADEX_BETWEEN_TOKENS_MAX_MS = 330000;
+// Delay setelah token 2 (sebelum pair berikutnya) (~1 jam)
+const TRADEX_AFTER_PAIR_MIN_MS = 3600000;   // 60 menit
+const TRADEX_AFTER_PAIR_MAX_MS = 3660000;   // 61 menit
+// TradeX defaults
+const TRADEX_DEFAULT_TTL_SECONDS = 300;
+const TRADEX_DEFAULT_SHOW_BALANCE_EACH_CYCLE = true;
 // Retry on 429
 const RATE_LIMIT_MAX_RETRY = 5;
 const RATE_LIMIT_FALLBACK_WAIT_MS = 8000;
-
 // How many times to re-prompt cookie if invalid/expired
 const AUTH_MAX_RETRY = 5;
-
 const C = {
   reset: "\x1b[0m",
   red: "\x1b[31m",
@@ -29,27 +33,21 @@ const C = {
   gray: "\x1b[90m",
   bold: "\x1b[1m",
 };
-
 const paint = (code, s) => `${code}${s}${C.reset}`;
 const tag = (label, color) => paint(color, label.padEnd(7));
-
 const logInfo = (s) => console.log(`${tag("[INFO]", C.cyan)} ${s}`);
 const logOk = (s) => console.log(`${tag("[OK]", C.green)} ${s}`);
 const logWarn = (s) => console.log(`${tag("[WARN]", C.yellow)} ${s}`);
 const logErr = (s) => console.log(`${tag("[ERR]", C.red)} ${s}`);
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
-
 async function sleepRandom(minMs, maxMs, label = "Delay") {
   const ms = randInt(minMs, maxMs);
-  logInfo(`${label}: ${ms}ms`);
+  logInfo(`${label}: ${ms / 1000}s`);
   await sleep(ms);
 }
-
 function readConfigIfExists() {
   if (!fs.existsSync(CONFIG_PATH)) return null;
   try {
@@ -59,43 +57,33 @@ function readConfigIfExists() {
     return null;
   }
 }
-
 function atomicWriteJson(filePath, obj) {
   const tmpPath = `${filePath}.tmp`;
   fs.writeFileSync(tmpPath, JSON.stringify(obj, null, 2), "utf8");
   fs.renameSync(tmpPath, filePath);
 }
-
 function normalizeConfig(cfg) {
   const out = cfg && typeof cfg === "object" ? cfg : {};
   if (!Array.isArray(out.accounts)) out.accounts = [];
-
-  // Backward compat: if old config has {cookie:"..."} migrate to accounts[0]
   if (typeof out.cookie === "string" && out.cookie.trim() && out.accounts.length === 0) {
     out.accounts.push({ label: "acc1", cookie: out.cookie.trim() });
     delete out.cookie;
   }
-
-  // Normalize each account
   out.accounts = out.accounts
     .filter((a) => a && typeof a === "object")
     .map((a, idx) => ({
       label: (typeof a.label === "string" && a.label.trim()) ? a.label.trim() : `acc${idx + 1}`,
       cookie: (typeof a.cookie === "string") ? a.cookie.trim() : "",
     }));
-
   return out;
 }
-
 function saveConfig(cfg) {
   atomicWriteJson(CONFIG_PATH, cfg);
 }
-
 function setAccountCookie(cfg, index, newCookie) {
   cfg.accounts[index].cookie = (newCookie || "").trim();
   saveConfig(cfg);
 }
-
 async function promptLine(question) {
   const rl = readline.createInterface({ input, output });
   try {
@@ -104,66 +92,58 @@ async function promptLine(question) {
     rl.close();
   }
 }
-
 async function promptYesNo(question, defaultYes = false) {
   const suffix = defaultYes ? " [Y/n]: " : " [y/N]: ";
   const ans = (await promptLine(question + suffix)).toLowerCase();
   if (!ans) return defaultYes;
   return ans === "y" || ans === "yes";
 }
-
 async function promptCookie(reason) {
   if (reason) logWarn(reason);
   return await promptLine("Enter cookie (paste the full value): ");
 }
-
 async function promptLabel(defaultLabel) {
   const s = await promptLine(`Account label (default: ${defaultLabel}): `);
   return s ? s : defaultLabel;
 }
-
-function makeHeaders(cookie, extra = {}) {
+async function promptMenu() {
+  console.log("");
+  console.log(paint(C.bold, "Select mode:"));
+  console.log("1) Auto task completion");
+  console.log("2) TradeX game (Token creations");
+  const ans = await promptLine("Enter choice (1/2): ");
+  if (ans === "1") return "TASKS";
+  if (ans === "2") return "TRADEX";
+  return null;
+}
+function makeHeaders(cookie, { extra = {}, referer = REFERER_APP } = {}) {
   return {
     accept: "*/*",
     "accept-language": "en-US,en;q=0.5",
     cookie,
-    Referer: REFERER,
+    Referer: referer,
     ...extra,
   };
 }
-
 function parseRetryAfterMs(retryAfterValue) {
   if (!retryAfterValue) return null;
-
-  // Retry-After can be seconds or an HTTP date
   const secs = Number(retryAfterValue);
-  if (!Number.isNaN(secs)) {
-    return Math.max(1000, Math.floor(secs * 1000));
-  }
-
+  if (!Number.isNaN(secs)) return Math.max(1000, Math.floor(secs * 1000));
   const t = Date.parse(retryAfterValue);
-  if (!Number.isNaN(t)) {
-    return Math.max(1000, t - Date.now());
-  }
-
+  if (!Number.isNaN(t)) return Math.max(1000, t - Date.now());
   return null;
 }
-
 function looksLikeAuthProblem(resStatus, json, text) {
   if (resStatus === 401 || resStatus === 403) return true;
-
   const msg = (
     (json && (json.message || json.error)) ||
     (typeof text === "string" ? text : "")
   ).toString();
-
   return /unauth|unauthoriz|forbidden|expired|cookie|login|session/i.test(msg);
 }
-
 async function requestJson(url, { method = "GET", headers = {}, body = null } = {}) {
   const res = await fetch(url, { method, headers, body });
   const text = await res.text();
-
   if (res.status === 429) {
     const ra = res.headers.get("retry-after");
     const waitMs = parseRetryAfterMs(ra) ?? RATE_LIMIT_FALLBACK_WAIT_MS;
@@ -173,7 +153,6 @@ async function requestJson(url, { method = "GET", headers = {}, body = null } = 
     err.retryAfterRaw = ra;
     throw err;
   }
-
   let json;
   try {
     json = text ? JSON.parse(text) : null;
@@ -186,12 +165,10 @@ async function requestJson(url, { method = "GET", headers = {}, body = null } = 
     }
     throw new Error(`Response is not JSON. HTTP ${res.status}. Snippet: ${text.slice(0, 200)}`);
   }
-
   if (!res.ok) {
     const msg = (json && (json.message || json.error))
       ? (json.message || json.error)
       : text.slice(0, 200);
-
     const err = new Error(`HTTP ${res.status}: ${msg}`);
     if (looksLikeAuthProblem(res.status, json, text)) {
       err.code = "AUTH";
@@ -199,34 +176,45 @@ async function requestJson(url, { method = "GET", headers = {}, body = null } = 
     }
     throw err;
   }
-
   return json;
 }
-
+// ----- Xage APIs -----
 async function getMe(cookie) {
   return requestJson(`${BASE_URL}/api/auth/me`, {
     method: "GET",
     headers: makeHeaders(cookie),
   });
 }
-
 async function getTasks(cookie) {
   return requestJson(`${BASE_URL}/api/tasks`, {
     method: "GET",
     headers: makeHeaders(cookie),
   });
 }
-
 async function completeTask(cookie, taskId) {
   return requestJson(`${BASE_URL}/api/tasks/${encodeURIComponent(taskId)}/complete`, {
     method: "POST",
-    headers: makeHeaders(cookie, {
-      "content-type": "application/json",
-    }),
+    headers: makeHeaders(cookie, { extra: { "content-type": "application/json" } }),
     body: null,
   });
 }
-
+async function createTradeXToken(cookie, payload) {
+  return requestJson(`${BASE_URL}/api/simulex/tokens`, {
+    method: "POST",
+    headers: makeHeaders(cookie, {
+      referer: REFERER_TRADEX,
+      extra: { "content-type": "application/json" },
+    }),
+    body: JSON.stringify(payload),
+  });
+}
+async function getTradeXBalance(cookie) {
+  return requestJson(`${BASE_URL}/api/simulex/balance`, {
+    method: "GET",
+    headers: makeHeaders(cookie, { referer: REFERER_TRADEX }),
+  });
+}
+// ----- Helpers -----
 function printAccount(user, prefix = "ACCOUNT") {
   const xHandle = user?.xHandle ?? "-";
   const accountAge = user?.accountAge ?? "-";
@@ -235,69 +223,54 @@ function printAccount(user, prefix = "ACCOUNT") {
     `${paint(C.bold, prefix)} | xHandle=${paint(C.cyan, xHandle)} | accountAge=${paint(C.gray, String(accountAge))} | points=${paint(C.green, String(points))}`
   );
 }
-
 async function ensureAccountsExist(cfg) {
   if (cfg.accounts.length > 0) return;
-
   logWarn("No accounts found in config.json. Let's add at least one account.");
   while (true) {
     const defaultLabel = `acc${cfg.accounts.length + 1}`;
     const label = await promptLabel(defaultLabel);
     const cookie = (await promptCookie(`Creating account "${label}".`)).trim();
-
     if (!cookie) {
       logWarn("Cookie cannot be empty.");
       continue;
     }
-
     cfg.accounts.push({ label, cookie });
     saveConfig(cfg);
-
     const addMore = await promptYesNo("Add another account?", false);
     if (!addMore) break;
   }
 }
-
 async function maybeAppendMoreAccounts(cfg) {
   const addMore = await promptYesNo("Do you want to add another account now?", false);
   if (!addMore) return;
-
   while (true) {
     const defaultLabel = `acc${cfg.accounts.length + 1}`;
     const label = await promptLabel(defaultLabel);
     const cookie = (await promptCookie(`Adding account "${label}".`)).trim();
-
     if (!cookie) {
       logWarn("Cookie cannot be empty.");
       continue;
     }
-
     cfg.accounts.push({ label, cookie });
     saveConfig(cfg);
-
     const again = await promptYesNo("Add one more account?", false);
     if (!again) break;
   }
 }
-
 async function ensureValidCookieForAccount(cfg, index) {
   let cookie = cfg.accounts[index].cookie || "";
   const label = cfg.accounts[index].label || `acc${index + 1}`;
-
   for (let i = 1; i <= AUTH_MAX_RETRY; i++) {
     if (!cookie.trim()) {
       cookie = (await promptCookie(`Cookie is missing for "${label}". Please enter it.`)).trim();
     }
-
     if (!cookie) {
       logWarn("Cookie cannot be empty.");
       continue;
     }
-
     try {
       const me = await getMe(cookie);
       if (!me?.success || !me?.user) throw new Error("Invalid /auth/me response.");
-      // Save cookie (so if user pasted a new one it persists)
       setAccountCookie(cfg, index, cookie);
       return { cookie, me };
     } catch (e) {
@@ -309,21 +282,17 @@ async function ensureValidCookieForAccount(cfg, index) {
       throw e;
     }
   }
-
   throw new Error(`Failed to validate cookie for "${label}" after multiple attempts.`);
 }
-
 async function refreshCookieForAccount(cfg, index, reason) {
   const label = cfg.accounts[index].label || `acc${index + 1}`;
   let cookie = "";
-
   for (let i = 1; i <= AUTH_MAX_RETRY; i++) {
     cookie = (await promptCookie(reason || `"${label}" cookie expired/invalid. Please enter a new cookie.`)).trim();
     if (!cookie) {
       logWarn("Cookie cannot be empty.");
       continue;
     }
-
     try {
       const me = await getMe(cookie);
       if (!me?.success || !me?.user) throw new Error("Invalid /auth/me response.");
@@ -338,19 +307,16 @@ async function refreshCookieForAccount(cfg, index, reason) {
       throw e;
     }
   }
-
   throw new Error(`Failed to refresh cookie for "${label}" after multiple attempts.`);
 }
-
-async function runForOneAccount(cfg, index) {
+// ----- Mode 1: Auto tasks -----
+async function runTasksForAccount(cfg, index) {
   const label = cfg.accounts[index].label || `acc${index + 1}`;
-
-  logInfo(`========== ACCOUNT: ${label} ==========`);
+  logInfo(`========== MODE: TASKS | ACCOUNT: ${label} ==========`);
 
   let { cookie, me: me0 } = await ensureValidCookieForAccount(cfg, index);
   printAccount(me0.user, `START (${label})`);
 
-  // Fetch tasks (if auth drops, re-prompt only this account cookie)
   let t0;
   while (true) {
     try {
@@ -385,15 +351,10 @@ async function runForOneAccount(cfg, index) {
     let attempt = 0;
     while (attempt < RATE_LIMIT_MAX_RETRY) {
       attempt++;
-
       try {
         const done = await completeTask(cookie, t.id);
-
-        if (done?.success) {
-          logOk(`"${label}" done. pointsAwarded=${done.pointsAwarded}, newTotal=${done.newTotal}`);
-        } else {
-          logWarn(`"${label}" success=false for task id=${t.id}`);
-        }
+        if (done?.success) logOk(`"${label}" done. pointsAwarded=${done.pointsAwarded}, newTotal=${done.newTotal}`);
+        else logWarn(`"${label}" success=false for task id=${t.id}`);
         break;
       } catch (e) {
         if (e && e.code === "AUTH") {
@@ -417,15 +378,11 @@ async function runForOneAccount(cfg, index) {
       }
     }
 
-    // Refresh account info (if auth drops, re-prompt only this account cookie)
     while (true) {
       try {
         const meAfter = await getMe(cookie);
-        if (meAfter?.success && meAfter?.user) {
-          printAccount(meAfter.user, `AFTER (${label})`);
-        } else {
-          logWarn(`"${label}" failed to refresh /auth/me after task.`);
-        }
+        if (meAfter?.success && meAfter?.user) printAccount(meAfter.user, `AFTER (${label})`);
+        else logWarn(`"${label}" failed to refresh /auth/me after task.`);
         break;
       } catch (e) {
         if (e && e.code === "AUTH") {
@@ -441,26 +398,201 @@ async function runForOneAccount(cfg, index) {
 
   logOk(`"${label}" finished processing incomplete tasks.`);
 }
+// ----- Mode 2: TradeX  -----
+function randomLetters(len, upper = false) {
+  const A = upper ? "ABCDEFGHIJKLMNOPQRSTUVWXYZ" : "abcdefghijklmnopqrstuvwxyz";
+  let s = "";
+  for (let i = 0; i < len; i++) s += A[randInt(0, A.length - 1)];
+  return s;
+}
+function randomTradeXName() {
+  return randomLetters(randInt(1, 3), false);
+}
+function randomTicker() {
+  return randomLetters(randInt(1, 5), true);
+}
+function randomDescription(name, ticker) {
+  const templates = [
+    `${name} (${ticker}) is live on TradeX.`,
+    `Auto token ${ticker}.`,
+    `Launch: ${name} / ${ticker}.`,
+    `TradeX drop: ${ticker}.`,
+    `New sim token: ${name}.`,
+  ];
+  return templates[randInt(0, templates.length - 1)];
+}
+async function createOneTokenForAccount(cfg, index, state) {
+  const label = cfg.accounts[index].label || `acc${index + 1}`;
 
-(async function main() {
+  // Ensure cookie is valid (and saved)
+  let cookie = cfg.accounts[index].cookie || "";
+  let me;
   try {
-    const cfg0 = normalizeConfig(readConfigIfExists());
-    saveConfig(cfg0); // ensure config file exists in the new format
+    const r = await ensureValidCookieForAccount(cfg, index);
+    cookie = r.cookie;
+    me = r.me;
+  } catch (e) {
+    logErr(`"${label}" cannot validate cookie: ${e.message}`);
+    return;
+  }
 
-    await ensureAccountsExist(cfg0);
+  if (me?.user) {
+    printAccount(me.user, `TRADEX (${label})`);
+  }
 
-    // Optional: ask to add more accounts at startup even if accounts already exist
-    await maybeAppendMoreAccounts(cfg0);
+  const name = randomTradeXName();
+  const ticker = randomTicker();
+  const description = randomDescription(name, ticker);
 
-    for (let i = 0; i < cfg0.accounts.length; i++) {
-      try {
-        await runForOneAccount(cfg0, i);
-      } catch (e) {
-        logErr(`Account "${cfg0.accounts[i]?.label || `acc${i + 1}`}" failed: ${e.message}`);
+  const payload = {
+    name,
+    ticker,
+    description,
+    ttlSeconds: TRADEX_DEFAULT_TTL_SECONDS,
+    image: null,
+  };
+
+  let attempt = 0;
+  while (attempt < RATE_LIMIT_MAX_RETRY) {
+    attempt++;
+    try {
+      const res = await createTradeXToken(cookie, payload);
+      if (res?.success && res?.token) {
+        logOk(`"${label}" token created: id=${res.token.id} name=${res.token.name} ticker=${res.token.ticker} ttlSeconds=${res.token.ttlSeconds}`);
+      } else {
+        logWarn(`"${label}" token create returned success=false`);
       }
+      return;
+    } catch (e) {
+      if (state.stopRequested) return;
+
+      if (e && e.code === "AUTH") {
+        const refreshed = await refreshCookieForAccount(cfg, index, `"${label}" cookie expired while creating a token.`);
+        cookie = refreshed.cookie;
+        attempt--;
+        continue;
+      }
+
+      if (e && e.code === "RATE_LIMIT") {
+        const waitMs = e.waitMs ?? RATE_LIMIT_FALLBACK_WAIT_MS;
+        const raRaw = e.retryAfterRaw ? ` (Retry-After=${e.retryAfterRaw})` : "";
+        logWarn(`"${label}" HTTP 429. Waiting ${waitMs}ms${raRaw}, then retry (${attempt}/${RATE_LIMIT_MAX_RETRY})`);
+        await sleep(waitMs);
+        await sleepRandom(500, 1500, `"${label}" jitter`);
+        continue;
+      }
+
+      logWarn(`"${label}" token create failed: ${e.message}`);
+      return;
+    }
+  }
+}
+
+async function showBalancesForAll(cfg, state) {
+  if (!TRADEX_DEFAULT_SHOW_BALANCE_EACH_CYCLE) return;
+
+  for (let i = 0; i < cfg.accounts.length; i++) {
+    if (state.stopRequested) return;
+
+    const label = cfg.accounts[i].label || `acc${i + 1}`;
+    let cookie = cfg.accounts[i].cookie || "";
+
+    try {
+      const r = await ensureValidCookieForAccount(cfg, i);
+      cookie = r.cookie;
+    } catch (e) {
+      logWarn(`"${label}" skip balance (cookie invalid): ${e.message}`);
+      continue;
     }
 
-    logOk("All accounts processed.");
+    try {
+      const b = await getTradeXBalance(cookie);
+      if (b?.success) logInfo(`"${label}" TradeX balance: ${b.balance}`);
+      else logWarn(`"${label}" balance returned success=false`);
+    } catch (e) {
+      if (e && e.code === "AUTH") {
+        await refreshCookieForAccount(cfg, i, `"${label}" cookie expired while fetching TradeX balance.`);
+      } else {
+        logWarn(`"${label}" failed to fetch TradeX balance: ${e.message}`);
+      }
+    }
+  }
+}
+async function runTradeXAllAccountsForever(cfg) {
+  const state = { stopRequested: false };
+  process.on("SIGINT", () => {
+    if (state.stopRequested) return;
+    state.stopRequested = true;
+    console.log("");
+    logWarn("Stop requested (Ctrl+C). Finishing current step, then exiting...");
+  });
+  logInfo("TradeX mode: 2 token creations per account per ~1 hour. Running forever until Ctrl+C.");
+  let cycle = 0;
+  let pairNumber = 0;
+  while (!state.stopRequested) {
+    cycle++;
+    const attemptInPair = (cycle % 2 === 1) ? 1 : 2;
+    if (attemptInPair === 1) {
+      pairNumber++;
+      logInfo(`========== NEW PAIR #${pairNumber} : Starting 2 token creations ==========`);
+    }
+    logInfo(`========== TOKEN CREATION #${cycle} (attempt ${attemptInPair}/2 in pair ${pairNumber}) ==========`);
+    // Create token untuk semua akun
+    for (let i = 0; i < cfg.accounts.length; i++) {
+      if (state.stopRequested) break;
+      await createOneTokenForAccount(cfg, i, state);
+    }
+    // Show balance
+    if (!state.stopRequested) {
+      await showBalancesForAll(cfg, state);
+    }
+    // Delay sesuai posisi
+    if (!state.stopRequested) {
+      if (attemptInPair === 1) {
+        // Setelah token pertama → delay ~5 menit
+        await sleepRandom(
+          TRADEX_BETWEEN_TOKENS_MIN_MS,
+          TRADEX_BETWEEN_TOKENS_MAX_MS,
+          "Delay before second token"
+        );
+      } else {
+        // Setelah token kedua → delay ~1 jam
+        await sleepRandom(
+          TRADEX_AFTER_PAIR_MIN_MS,
+          TRADEX_AFTER_PAIR_MAX_MS,
+          "Delay ~1 hour before next pair"
+        );
+      }
+    }
+  }
+  logOk("TradeX stopped.");
+}
+(async function main() {
+  try {
+    const cfg = normalizeConfig(readConfigIfExists());
+    saveConfig(cfg);
+    await ensureAccountsExist(cfg);
+    await maybeAppendMoreAccounts(cfg);
+    let mode = await promptMenu();
+    while (!mode) {
+      logWarn("Invalid choice. Please enter 1 or 2.");
+      mode = await promptMenu();
+    }
+    if (mode === "TASKS") {
+      for (let i = 0; i < cfg.accounts.length; i++) {
+        try {
+          await runTasksForAccount(cfg, i);
+        } catch (e) {
+          logErr(`Account "${cfg.accounts[i]?.label || `acc${i + 1}`}" failed: ${e.message}`);
+        }
+      }
+      logOk("All accounts processed (TASKS).");
+      return;
+    }
+    if (mode === "TRADEX") {
+      await runTradeXAllAccountsForever(cfg);
+      return;
+    }
   } catch (e) {
     logErr(e.message);
     process.exitCode = 1;
