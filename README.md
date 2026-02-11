@@ -1,5 +1,6 @@
 # ✖️age
-Xage Automated task completion, Multi Accounts
+Xage Automated task completion, Multi Accounts <br>
+<img width="320" height="420" alt="Screenshot 2026-02-11 at 15 36 36" src="https://github.com/user-attachments/assets/3068603d-9b93-48b7-a8d8-1185e9e8745d" />
 
 > [!WARNING]
 > ### The use of this bot is entirely at your own risk. I assume no liability for any losses, damages, or consequences arising from its use.
@@ -7,6 +8,7 @@ Xage Automated task completion, Multi Accounts
 ## 🦾 Script Features
 
  - Multiple Accounts
+ - TradeX game (Token Creations)
 
 ## 🔓 Register 
 
