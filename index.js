@@ -20,10 +20,10 @@ const TRADEX_AFTER_PAIR_MAX_MS = 3660000;   // 61 menit
 const TRADEX_DEFAULT_TTL_SECONDS = 300;
 const TRADEX_DEFAULT_SHOW_BALANCE_EACH_CYCLE = true;
 // Retry on 429
-const RATE_LIMIT_MAX_RETRY = 5;
+const RATE_LIMIT_MAX_RETRY = 3;
 const RATE_LIMIT_FALLBACK_WAIT_MS = 8000;
 // How many times to re-prompt cookie if invalid/expired
-const AUTH_MAX_RETRY = 5;
+const AUTH_MAX_RETRY = 3;
 const C = {
   reset: "\x1b[0m",
   red: "\x1b[31m",
@@ -43,10 +43,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
-async function sleepRandom(minMs, maxMs, label = "Delay") {
+// Modified: interruptible sleep untuk delay panjang di TradeX
+async function sleepRandom(minMs, maxMs, label = "Delay", state = null) {
   const ms = randInt(minMs, maxMs);
-  logInfo(`${label}: ${ms / 1000}s`);
-  await sleep(ms);
+  logInfo(`${label}: ${ms / 1000}s${state ? " (interruptible)" : ""}`);
+  
+  if (state && state.stopRequested) return;
+  
+  const chunk = 5000; // cek tiap 5 detik
+  let remaining = ms;
+  while (remaining > 0) {
+    if (state && state.stopRequested) {
+      logWarn(`${label} interrupted by Ctrl+C!`);
+      return;
+    }
+    const sleepTime = Math.min(chunk, remaining);
+    await sleep(sleepTime);
+    remaining -= sleepTime;
+  }
 }
 function readConfigIfExists() {
   if (!fs.existsSync(CONFIG_PATH)) return null;
@@ -110,7 +124,7 @@ async function promptMenu() {
   console.log("");
   console.log(paint(C.bold, "Select mode:"));
   console.log("1) Auto task completion");
-  console.log("2) TradeX game (Token creations");
+  console.log("2) TradeX game (Token creations)");
   const ans = await promptLine("Enter choice (1/2): ");
   if (ans === "1") return "TASKS";
   if (ans === "2") return "TRADEX";
@@ -406,10 +420,10 @@ function randomLetters(len, upper = false) {
   return s;
 }
 function randomTradeXName() {
-  return randomLetters(randInt(1, 3), false);
+  return randomLetters(randInt(2, 5), false);
 }
 function randomTicker() {
-  return randomLetters(randInt(1, 5), true);
+  return randomLetters(randInt(3, 4), true);
 }
 function randomDescription(name, ticker) {
   const templates = [
@@ -518,14 +532,27 @@ async function showBalancesForAll(cfg, state) {
     }
   }
 }
+// Modified TradeX loop
 async function runTradeXAllAccountsForever(cfg) {
   const state = { stopRequested: false };
+  
+  // SIGINT handler: Ctrl+C sekali → interrupt & exit clean, dua kali → force quit
+  let forceQuit = false;
   process.on("SIGINT", () => {
-    if (state.stopRequested) return;
+    if (forceQuit) {
+      logErr("Force quit requested!");
+      process.exit(0);
+    }
+    if (state.stopRequested) {
+      forceQuit = true;
+      logWarn("Second Ctrl+C detected → force quit!");
+      return;
+    }
     state.stopRequested = true;
     console.log("");
-    logWarn("Stop requested (Ctrl+C). Finishing current step, then exiting...");
+    logWarn("Stop requested (Ctrl+C). Interrupting current delay and exiting soon...");
   });
+  
   logInfo("TradeX mode: 2 token creations per account per ~1 hour. Running forever until Ctrl+C.");
   let cycle = 0;
   let pairNumber = 0;
@@ -537,35 +564,40 @@ async function runTradeXAllAccountsForever(cfg) {
       logInfo(`========== NEW PAIR #${pairNumber} : Starting 2 token creations ==========`);
     }
     logInfo(`========== TOKEN CREATION #${cycle} (attempt ${attemptInPair}/2 in pair ${pairNumber}) ==========`);
+    
     // Create token untuk semua akun
     for (let i = 0; i < cfg.accounts.length; i++) {
       if (state.stopRequested) break;
       await createOneTokenForAccount(cfg, i, state);
     }
+    
     // Show balance
     if (!state.stopRequested) {
       await showBalancesForAll(cfg, state);
     }
-    // Delay sesuai posisi
+    
+    // Delay sesuai posisi (interruptible karena pass state)
     if (!state.stopRequested) {
       if (attemptInPair === 1) {
         // Setelah token pertama → delay ~5 menit
         await sleepRandom(
           TRADEX_BETWEEN_TOKENS_MIN_MS,
           TRADEX_BETWEEN_TOKENS_MAX_MS,
-          "Delay before second token"
+          "Delay before second token",
+          state
         );
       } else {
         // Setelah token kedua → delay ~1 jam
         await sleepRandom(
           TRADEX_AFTER_PAIR_MIN_MS,
           TRADEX_AFTER_PAIR_MAX_MS,
-          "Delay ~1 hour before next pair"
+          "Delay ~1 hour before next pair",
+          state
         );
       }
     }
   }
-  logOk("TradeX stopped.");
+  logOk("TradeX stopped gracefully.");
 }
 (async function main() {
   try {
