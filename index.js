@@ -7,21 +7,30 @@ const { stdin: input, stdout: output } = require("process");
 const BASE_URL = "https://xage.app";
 const REFERER_APP = "https://xage.app/app";
 const REFERER_TRADEX = "https://xage.app/app/games/tradex";
+const REFERER_SITUATIONX = "https://xage.app/app/games/situationx";
 const CONFIG_PATH = path.join(__dirname, "config.json");
+const SITUATIONS_PATH = path.join(__dirname, "situation.json");
 
 // Task delay (12–15 seconds)
 const TASK_DELAY_MIN_MS = 12000;
 const TASK_DELAY_MAX_MS = 15000;
 
-// Delay between token 1 and token 2 (~5 min)
-const TRADEX_BETWEEN_TOKENS_MIN_MS = 315000;
-const TRADEX_BETWEEN_TOKENS_MAX_MS = 330000;
+// Delay between creations in a group (~3.5 min for SituationX, ~5 min for TradeX)
+const TRADEX_BETWEEN_CREATIONS_MIN_MS = 315000;
+const TRADEX_BETWEEN_CREATIONS_MAX_MS = 330000;
+const SITUATIONX_BETWEEN_CREATIONS_MIN_MS = 210000; // 3.5 minutes
+const SITUATIONX_BETWEEN_CREATIONS_MAX_MS = 225000;
 
-// Delay after token 2 (~1 hour)
-const TRADEX_AFTER_PAIR_MIN_MS = 3600000;
-const TRADEX_AFTER_PAIR_MAX_MS = 3660000;
+// Delay after group (~1 hour)
+const AFTER_GROUP_MIN_MS = 3600000;
+const AFTER_GROUP_MAX_MS = 3660000;
 
-// TradeX defaults
+// TradeX defaults: 2 creations per group
+const TRADEX_CREATIONS_PER_GROUP = 2;
+
+// SituationX defaults: 3 creations per group
+const SITUATIONX_CREATIONS_PER_GROUP = 3;
+
 const TRADEX_DEFAULT_TTL_SECONDS = 300;
 const TRADEX_DEFAULT_SHOW_BALANCE_EACH_CYCLE = true;
 
@@ -156,10 +165,12 @@ async function promptMenu() {
   console.log("1) Auto task completion");
   console.log("2) TradeX game (Token creations)");
   console.log("3) Open Lootboxes");
-  const ans = await promptLine("Enter choice (1/2/3): ");
+  console.log("4) SituationX Games");
+  const ans = await promptLine("Enter choice (1/2/3/4): ");
   if (ans === "1") return "TASKS";
   if (ans === "2") return "TRADEX";
   if (ans === "3") return "LOOTBOX";
+  if (ans === "4") return "SITUATIONX";
   return null;
 }
 
@@ -272,11 +283,18 @@ async function createTradeXToken(cookie, payload) {
     body: JSON.stringify(payload),
   });
 }
-
+//api/situationx/balance
 async function getTradeXBalance(cookie) {
   return requestJson(`${BASE_URL}/api/simulex/balance`, {
     method: "GET",
     headers: makeHeaders(cookie, { referer: REFERER_TRADEX }),
+  });
+}
+
+async function getSituationXBalance(cookie) {
+  return requestJson(`${BASE_URL}/api/situationx/balance`, {
+    method: "GET",
+    headers: makeHeaders(cookie, { referer: REFERER_SITUATIONX }),
   });
 }
 
@@ -288,6 +306,17 @@ async function openLootbox(cookie, lootboxId) {
       extra: { "content-type": "application/json" }
     }),
     body: JSON.stringify({ lootboxId: Number(lootboxId) }),
+  });
+}
+
+async function createSituation(cookie, payload) {
+  return requestJson(`${BASE_URL}/api/situationx/situations`, {
+    method: "POST",
+    headers: makeHeaders(cookie, {
+      referer: REFERER_SITUATIONX,
+      extra: { "content-type": "application/json" },
+    }),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -655,6 +684,176 @@ async function runLootboxForAccount(cfg, index) {
   logOk(`"${label}" finished. Total opened: ${opened} ${lb.emoji}`);
 }
 
+// ----- Mode 4: SituationX -----
+function loadSituations() {
+  if (!fs.existsSync(SITUATIONS_PATH)) {
+    logErr("situation.json not found! Please create it with an array of situations.");
+    process.exit(1);
+  }
+  try {
+    const raw = fs.readFileSync(SITUATIONS_PATH, "utf8");
+    const situations = JSON.parse(raw);
+    if (!Array.isArray(situations) || situations.length === 0) {
+      logErr("situation.json must be an array of objects with question, outcomeA, outcomeB.");
+      process.exit(1);
+    }
+    return situations;
+  } catch (e) {
+    logErr(`Failed to load situation.json: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+function selectUniqueRandomSituations(situations, numAccounts) {
+  if (situations.length < numAccounts) {
+    logWarn(`Not enough unique situations (${situations.length}) for ${numAccounts} accounts. Duplicates may occur.`);
+  }
+  const shuffled = [...situations].sort(() => 0.5 - Math.random());
+  return shuffled.slice(0, numAccounts);
+}
+
+async function createOneSituationForAccount(cfg, index, payload, state) {
+  const label = cfg.accounts[index].label || `acc${index + 1}`;
+  let cookie = cfg.accounts[index].cookie || "";
+  let me;
+  try {
+    const r = await ensureValidCookieForAccount(cfg, index);
+    cookie = r.cookie;
+    me = r.me;
+  } catch (e) {
+    logErr(`"${label}" cannot validate cookie: ${e.message}`);
+    return;
+  }
+  if (me?.user) printAccount(me.user, `SITUATIONX (${label})`);
+
+  let attempt = 0;
+  while (attempt < RATE_LIMIT_MAX_RETRY) {
+    attempt++;
+    try {
+      const res = await createSituation(cookie, payload);
+      if (res?.success && res?.situation) {
+        logOk(`"${label}" situation created: id=${res.situation.id} question="${res.situation.question}"`);
+      } else {
+        logWarn(`"${label}" situation create returned success=false`);
+      }
+      return;
+    } catch (e) {
+      if (state.stopRequested) return;
+      if (e && e.code === "AUTH") {
+        const refreshed = await refreshCookieForAccount(cfg, index, `"${label}" cookie expired while creating a situation.`);
+        cookie = refreshed.cookie;
+        attempt--;
+        continue;
+      }
+      if (e && e.code === "RATE_LIMIT") {
+        const waitMs = e.waitMs ?? RATE_LIMIT_FALLBACK_WAIT_MS;
+        const raRaw = e.retryAfterRaw ? ` (Retry-After=${e.retryAfterRaw})` : "";
+        logWarn(`"${label}" HTTP 429. Waiting ${waitMs}ms${raRaw}, then retry (${attempt}/${RATE_LIMIT_MAX_RETRY})`);
+        await sleep(waitMs);
+        await sleepRandom(500, 1500, `"${label}" jitter`);
+        continue;
+      }
+      logWarn(`"${label}" situation create failed: ${e.message}`);
+      return;
+    }
+  }
+}
+
+async function showBalancesForAllSTX(cfg, state) {
+  if (!TRADEX_DEFAULT_SHOW_BALANCE_EACH_CYCLE) return;
+  for (let i = 0; i < cfg.accounts.length; i++) {
+    if (state.stopRequested) return;
+    const label = cfg.accounts[i].label || `acc${i + 1}`;
+    let cookie = cfg.accounts[i].cookie || "";
+    try {
+      const r = await ensureValidCookieForAccount(cfg, i);
+      cookie = r.cookie;
+    } catch (e) {
+      logWarn(`"${label}" skip balance (cookie invalid): ${e.message}`);
+      continue;
+    }
+    try {
+      const b = await getSituationXBalance(cookie);
+      if (b?.success) logInfo(`"${label}" SituationX balance: ${b.balance}`);
+      else logWarn(`"${label}" balance returned success=false`);
+    } catch (e) {
+      if (e && e.code === "AUTH") {
+        await refreshCookieForAccount(cfg, i, `"${label}" cookie expired while fetching SituationX balance.`);
+      } else {
+        logWarn(`"${label}" failed to fetch SituationX balance: ${e.message}`);
+      }
+    }
+  }
+}
+
+async function runSituationXAllAccountsForever(cfg) {
+  const state = { stopRequested: false };
+
+  let forceQuit = false;
+  process.on("SIGINT", () => {
+    if (forceQuit) {
+      logErr("Force quit requested!");
+      process.exit(0);
+    }
+    if (state.stopRequested) {
+      forceQuit = true;
+      logWarn("Second Ctrl+C detected → force quit!");
+      return;
+    }
+    state.stopRequested = true;
+    console.log("");
+    logWarn("Stop requested (Ctrl+C). Interrupting current delay and exiting soon...");
+  });
+
+  const situations = loadSituations();
+
+  logInfo(`SituationX mode: 3 situation creations per account per ~1 hour. Running forever until Ctrl+C. Loaded ${situations.length} situations.`);
+  let cycle = 0;
+  let groupNumber = 0;
+
+  while (!state.stopRequested) {
+    cycle++;
+    const attemptInGroup = ((cycle - 1) % SITUATIONX_CREATIONS_PER_GROUP) + 1;
+    if (attemptInGroup === 1) {
+      groupNumber++;
+      logInfo(`========== NEW GROUP #${groupNumber} : Starting 3 situation creations ==========`);
+    }
+    logInfo(`========== SITUATION CREATION #${cycle} (attempt ${attemptInGroup}/${SITUATIONX_CREATIONS_PER_GROUP} in group ${groupNumber}) ==========`);
+
+    // Select unique random situations for this creation cycle across all accounts
+    const selectedSituations = selectUniqueRandomSituations(situations, cfg.accounts.length);
+
+    for (let i = 0; i < cfg.accounts.length; i++) {
+      if (state.stopRequested) break;
+      const payload = selectedSituations[i % selectedSituations.length]; // Fallback if fewer situations than accounts
+      await createOneSituationForAccount(cfg, i, payload, state);
+    }
+
+    if (!state.stopRequested) {
+      await showBalancesForAllSTX(cfg, state);
+    }
+
+    if (!state.stopRequested) {
+      if (attemptInGroup < SITUATIONX_CREATIONS_PER_GROUP) {
+        await sleepRandom(
+          SITUATIONX_BETWEEN_CREATIONS_MIN_MS,
+          SITUATIONX_BETWEEN_CREATIONS_MAX_MS,
+          "Delay before next creation in group",
+          state
+        );
+      } else {
+        await sleepRandom(
+          AFTER_GROUP_MIN_MS,
+          AFTER_GROUP_MAX_MS,
+          "Delay ~1 hour before next group",
+          state
+        );
+      }
+    }
+  }
+  logOk("SituationX stopped gracefully.");
+}
+
 // ----- TradeX loop -----
 async function showBalancesForAll(cfg, state) {
   if (!TRADEX_DEFAULT_SHOW_BALANCE_EACH_CYCLE) return;
@@ -704,16 +903,16 @@ async function runTradeXAllAccountsForever(cfg) {
 
   logInfo("TradeX mode: 2 token creations per account per ~1 hour. Running forever until Ctrl+C.");
   let cycle = 0;
-  let pairNumber = 0;
+  let groupNumber = 0;
 
   while (!state.stopRequested) {
     cycle++;
-    const attemptInPair = (cycle % 2 === 1) ? 1 : 2;
-    if (attemptInPair === 1) {
-      pairNumber++;
-      logInfo(`========== NEW PAIR #${pairNumber} : Starting 2 token creations ==========`);
+    const attemptInGroup = ((cycle - 1) % TRADEX_CREATIONS_PER_GROUP) + 1;
+    if (attemptInGroup === 1) {
+      groupNumber++;
+      logInfo(`========== NEW GROUP #${groupNumber} : Starting 2 token creations ==========`);
     }
-    logInfo(`========== TOKEN CREATION #${cycle} (attempt ${attemptInPair}/2 in pair ${pairNumber}) ==========`);
+    logInfo(`========== TOKEN CREATION #${cycle} (attempt ${attemptInGroup}/${TRADEX_CREATIONS_PER_GROUP} in group ${groupNumber}) ==========`);
 
     for (let i = 0; i < cfg.accounts.length; i++) {
       if (state.stopRequested) break;
@@ -725,18 +924,18 @@ async function runTradeXAllAccountsForever(cfg) {
     }
 
     if (!state.stopRequested) {
-      if (attemptInPair === 1) {
+      if (attemptInGroup < TRADEX_CREATIONS_PER_GROUP) {
         await sleepRandom(
-          TRADEX_BETWEEN_TOKENS_MIN_MS,
-          TRADEX_BETWEEN_TOKENS_MAX_MS,
-          "Delay before second token",
+          TRADEX_BETWEEN_CREATIONS_MIN_MS,
+          TRADEX_BETWEEN_CREATIONS_MAX_MS,
+          "Delay before next creation in group",
           state
         );
       } else {
         await sleepRandom(
-          TRADEX_AFTER_PAIR_MIN_MS,
-          TRADEX_AFTER_PAIR_MAX_MS,
-          "Delay ~1 hour before next pair",
+          AFTER_GROUP_MIN_MS,
+          AFTER_GROUP_MAX_MS,
+          "Delay ~1 hour before next group",
           state
         );
       }
@@ -756,7 +955,7 @@ async function runTradeXAllAccountsForever(cfg) {
 
     let mode = await promptMenu();
     while (!mode) {
-      logWarn("Invalid choice. Please enter 1, 2 or 3.");
+      logWarn("Invalid choice. Please enter 1, 2, 3 or 4.");
       mode = await promptMenu();
     }
 
@@ -784,6 +983,11 @@ async function runTradeXAllAccountsForever(cfg) {
         await runLootboxForAccount(cfg, i);
       }
       logOk("=== ALL ACCOUNTS FINISHED LOOTBOX ===");
+      return;
+    }
+
+    if (mode === "SITUATIONX") {
+      await runSituationXAllAccountsForever(cfg);
       return;
     }
   } catch (e) {
