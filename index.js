@@ -283,18 +283,11 @@ async function createTradeXToken(cookie, payload) {
     body: JSON.stringify(payload),
   });
 }
-//api/situationx/balance
+
 async function getTradeXBalance(cookie) {
   return requestJson(`${BASE_URL}/api/simulex/balance`, {
     method: "GET",
     headers: makeHeaders(cookie, { referer: REFERER_TRADEX }),
-  });
-}
-
-async function getSituationXBalance(cookie) {
-  return requestJson(`${BASE_URL}/api/situationx/balance`, {
-    method: "GET",
-    headers: makeHeaders(cookie, { referer: REFERER_SITUATIONX }),
   });
 }
 
@@ -317,6 +310,31 @@ async function createSituation(cookie, payload) {
       extra: { "content-type": "application/json" },
     }),
     body: JSON.stringify(payload),
+  });
+}
+
+async function getSituationXLootboxes(cookie) {
+  return requestJson(`${BASE_URL}/api/situationx/lootboxes`, {
+    method: "GET",
+    headers: makeHeaders(cookie, { referer: REFERER_SITUATIONX }),
+  });
+}
+
+async function getSituationXBalance(cookie) {
+  return requestJson(`${BASE_URL}/api/situationx/balance`, {
+    method: "GET",
+    headers: makeHeaders(cookie, { referer: REFERER_SITUATIONX }),
+  });
+}
+
+async function openSituationXLootbox(cookie, lootboxId) {
+  return requestJson(`${BASE_URL}/api/situationx/lootbox/open`, {
+    method: "POST",
+    headers: makeHeaders(cookie, {
+      referer: REFERER_SITUATIONX,
+      extra: { "content-type": "application/json" }
+    }),
+    body: JSON.stringify({ lootboxId: Number(lootboxId) }),
   });
 }
 
@@ -512,7 +530,7 @@ function randomLetters(len, upper = false) {
 }
 
 function randomTradeXName() {
-  return randomLetters(randInt(2, 5), false);
+  return randomLetters(randInt(2, 3), false);
 }
 
 function randomTicker() {
@@ -597,12 +615,39 @@ async function runLootboxForAccount(cfg, index) {
   let { cookie, me } = await ensureValidCookieForAccount(cfg, index);
   printAccount(me.user, `LOOTBOX (${label})`);
 
+  // Choose lootbox type: TradeX or SituationX
+  console.log("");
+  console.log(paint(C.bold, "Choose Lootbox Type:"));
+  console.log("1) TradeX Lootboxes");
+  console.log("2) SituationX Lootboxes");
+  const typeAns = await promptLine("Enter choice (1/2): ");
+  const isTradeX = typeAns === "1";
+  const lootType = isTradeX ? "TradeX" : "SituationX";
+  const referer = isTradeX ? REFERER_TRADEX : REFERER_SITUATIONX;
+  logInfo(`Selected: ${lootType} Lootboxes`);
+
+  // Get lootboxes
+  let lootRes;
+  try {
+    lootRes = isTradeX ? await getLootboxes(cookie) : await getSituationXLootboxes(cookie);
+  } catch (e) {
+    if (e.code === "AUTH") {
+      const ref = await refreshCookieForAccount(cfg, index, `"${label}" cookie expired`);
+      cookie = ref.cookie;
+      return runLootboxForAccount(cfg, index); // retry
+    }
+    logErr(`Failed to get lootboxes: ${e.message}`);
+    return;
+  }
+
+  const lootboxes = lootRes.lootboxes || [];
+
   // Choose lootbox
   console.log("");
   console.log(paint(C.bold, "Choose Lootbox:"));
-  console.log(`1) ${LOOTBOX_INFO[1].emoji} Bronze  ($25)`);
-  console.log(`2) ${LOOTBOX_INFO[2].emoji} Silver  ($60)`);
-  console.log(`3) ${LOOTBOX_INFO[3].emoji} Gold    ($150)`);
+  console.log(`1) 🥉 Bronze  ($25)`);
+  console.log(`2) 🥈 Silver  ($60)`);
+  console.log(`3) 🥇 Gold    ($150)`);
 
   let lootboxId;
   while (true) {
@@ -628,7 +673,7 @@ async function runLootboxForAccount(cfg, index) {
     // Check balance
     let balanceRes;
     try {
-      balanceRes = await getTradeXBalance(cookie);
+      balanceRes = isTradeX ? await getTradeXBalance(cookie) : await getSituationXBalance(cookie);
     } catch (e) {
       if (e.code === "AUTH") {
         const ref = await refreshCookieForAccount(cfg, index, `"${label}" cookie expired`);
@@ -649,7 +694,7 @@ async function runLootboxForAccount(cfg, index) {
 
     // Open lootbox
     try {
-      const res = await openLootbox(cookie, lootboxId);
+      const res = isTradeX ? await openLootbox(cookie, lootboxId) : await openSituationXLootbox(cookie, lootboxId);
       opened++;
 
       if (res?.success && res.prize) {
